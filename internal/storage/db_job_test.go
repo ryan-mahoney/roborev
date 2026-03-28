@@ -175,6 +175,16 @@ func TestReviewVerdictComputation(t *testing.T) {
 		require.NoError(t, err, "GetReviewByJobID failed")
 
 		assert.Nil(t, review.Job.Verdict)
+
+		// Verify verdict_bool is NULL in DB (not a false fail)
+		var vb sql.NullInt64
+		err = env.db.QueryRow(
+			`SELECT verdict_bool FROM reviews WHERE job_id = ?`,
+			env.job.ID,
+		).Scan(&vb)
+		require.NoError(t, err)
+		assert.False(t, vb.Valid,
+			"verdict_bool should be NULL for empty output")
 	})
 
 	t.Run("verdict nil when job has error", func(t *testing.T) {
@@ -859,6 +869,39 @@ func TestReenqueueJob(t *testing.T) {
 	t.Run("rerun nonexistent job fails", func(t *testing.T) {
 		err := db.ReenqueueJob(99999)
 		require.Error(t, err)
+	})
+
+	t.Run("rerun preserves worktree_path", func(t *testing.T) {
+		isolatedDB := openTestDB(t)
+		defer isolatedDB.Close()
+
+		repo := createRepo(t, isolatedDB, "/tmp/wt-preserve-repo")
+		commit := createCommit(t, isolatedDB, repo.ID, "wt-preserve-sha")
+
+		job, err := isolatedDB.EnqueueJob(EnqueueOpts{
+			RepoID:       repo.ID,
+			CommitID:     commit.ID,
+			GitRef:       "wt-preserve-sha",
+			Agent:        "test",
+			WorktreePath: "/tmp/wt/feature-branch",
+		})
+		require.NoError(t, err)
+
+		claimed, err := isolatedDB.ClaimJob("worker-1")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		assert.Equal(t, job.ID, claimed.ID)
+
+		err = isolatedDB.CompleteJob(job.ID, "test", "prompt", "output")
+		require.NoError(t, err)
+
+		err = isolatedDB.ReenqueueJob(job.ID)
+		require.NoError(t, err)
+
+		updated, err := isolatedDB.GetJobByID(job.ID)
+		require.NoError(t, err)
+		assert.Equal(t, JobStatusQueued, updated.Status)
+		assert.Equal(t, "/tmp/wt/feature-branch", updated.WorktreePath)
 	})
 
 	t.Run("rerun done job and complete again", func(t *testing.T) {
